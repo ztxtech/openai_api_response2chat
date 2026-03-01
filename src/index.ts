@@ -1,7 +1,6 @@
 interface Env {
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
-  UPSTREAM_BASE_URL?: string;
   OUTBOUND_ACCEPT?: string;
   OUTBOUND_USER_AGENT?: string;
   OUTBOUND_ACCEPT_ENCODING?: string;
@@ -15,12 +14,7 @@ interface Env {
   OUTBOUND_SEC_FETCH_MODE?: string;
   OUTBOUND_SEC_FETCH_SITE?: string;
   OUTBOUND_PRIORITY?: string;
-  X_API_KEY_VALUE?: string;
   OUTBOUND_EXTRA_HEADERS?: string;
-  FORWARD_CLIENT_UA?: string;
-  FORWARD_CLIENT_ACCEPT?: string;
-  FORWARD_CLIENT_ACCEPT_ENCODING?: string;
-  FORWARD_ACCEPT_LANGUAGE?: string;
   FORWARD_BROWSER_HINT_HEADERS?: string;
   FORWARD_X_API_KEY?: string;
   ALLOWED_ORIGINS?: string;
@@ -53,7 +47,6 @@ interface ToolCall {
   };
 }
 
-const DEFAULT_UPSTREAM_BASE = "https://api.openai.com";
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) CherryStudio/1.7.21 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36";
@@ -117,13 +110,13 @@ async function proxyModels(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(request, env);
+  const authHeader = resolveAuthorization(env);
   if (!authHeader) {
     return jsonResponse(
       {
         error: {
           message:
-            "Missing Authorization. Provide OPENAI_API_KEY in Worker secrets or pass Authorization header.",
+            "Missing OPENAI_API_KEY secret in Worker.",
           type: "invalid_request_error",
         },
       },
@@ -132,15 +125,32 @@ async function proxyModels(
     );
   }
 
-  const upstreamUrl = buildUpstreamUrl(resolveUpstreamBaseUrl(env), "/v1/models");
-  const headers = buildUpstreamHeaders(request, env, authHeader, false);
+  const upstreamBaseUrl = resolveRequiredUpstreamBaseUrl(env);
+  if (!upstreamBaseUrl) {
+    return jsonResponse(
+      {
+        error: {
+          message: "Missing OPENAI_BASE_URL variable in Worker configuration.",
+          type: "invalid_request_error",
+        },
+      },
+      500,
+      corsHeaders,
+    );
+  }
+
+  const upstreamUrl = buildUpstreamUrl(upstreamBaseUrl, "/v1/models");
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
+    const upstreamRes = await fetchUpstreamWithRetry(env, {
+      upstreamUrl,
       method: "GET",
-      headers,
-      redirect: "follow",
+      authorization: authHeader,
+      stream: false,
     });
+    if (!upstreamRes.ok) {
+      return mapUpstreamErrorResponse(upstreamRes, corsHeaders, upstreamUrl);
+    }
     return withCors(upstreamRes, corsHeaders);
   } catch (error) {
     return jsonResponse(
@@ -161,17 +171,31 @@ async function handleChatCompletions(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(request, env);
+  const authHeader = resolveAuthorization(env);
   if (!authHeader) {
     return jsonResponse(
       {
         error: {
           message:
-            "Missing Authorization. Provide OPENAI_API_KEY in Worker secrets or pass Authorization header.",
+            "Missing OPENAI_API_KEY secret in Worker.",
           type: "invalid_request_error",
         },
       },
       401,
+      corsHeaders,
+    );
+  }
+
+  const upstreamBaseUrl = resolveRequiredUpstreamBaseUrl(env);
+  if (!upstreamBaseUrl) {
+    return jsonResponse(
+      {
+        error: {
+          message: "Missing OPENAI_BASE_URL variable in Worker configuration.",
+          type: "invalid_request_error",
+        },
+      },
+      500,
       corsHeaders,
     );
   }
@@ -248,17 +272,17 @@ async function handleChatCompletions(
     );
   }
 
-  const upstreamUrl = buildUpstreamUrl(resolveUpstreamBaseUrl(env), "/v1/responses");
+  const upstreamUrl = buildUpstreamUrl(upstreamBaseUrl, "/v1/responses");
   const stream = Boolean(chatRequest.stream);
-  const headers = buildUpstreamHeaders(request, env, authHeader, stream);
 
   let upstreamRes: Response;
   try {
-    upstreamRes = await fetch(upstreamUrl, {
+    upstreamRes = await fetchUpstreamWithRetry(env, {
+      upstreamUrl,
       method: "POST",
-      headers,
+      authorization: authHeader,
+      stream,
       body: JSON.stringify(responsesPayload),
-      redirect: "follow",
     });
   } catch (error) {
     return jsonResponse(
@@ -275,7 +299,7 @@ async function handleChatCompletions(
 
   if (!stream) {
     if (!upstreamRes.ok) {
-      return withCors(upstreamRes, corsHeaders);
+      return mapUpstreamErrorResponse(upstreamRes, corsHeaders, upstreamUrl);
     }
 
     let responsesBody: JsonObject;
@@ -299,63 +323,185 @@ async function handleChatCompletions(
   }
 
   const contentType = upstreamRes.headers.get("content-type") ?? "";
-  if (!upstreamRes.ok || !contentType.includes("text/event-stream")) {
-    return withCors(upstreamRes, corsHeaders);
+  if (!upstreamRes.ok) {
+    return mapUpstreamErrorResponse(upstreamRes, corsHeaders, upstreamUrl);
+  }
+  if (!contentType.includes("text/event-stream")) {
+    return jsonResponse(
+      {
+        error: {
+          message: `Expected upstream SSE response for stream=true, got content-type: ${contentType || "unknown"}.`,
+          type: "api_error",
+        },
+      },
+      502,
+      corsHeaders,
+    );
   }
 
   return convertResponsesStreamToChatStream(upstreamRes, chatRequest, corsHeaders);
 }
 
-function resolveAuthorization(request: Request, env: Env): string | null {
+function resolveAuthorization(env: Env): string | null {
   if (env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0) {
     return `Bearer ${env.OPENAI_API_KEY.trim()}`;
-  }
-  const inbound = request.headers.get("authorization");
-  if (inbound && inbound.trim().length > 0) {
-    return inbound.trim();
   }
   return null;
 }
 
+interface UpstreamFetchOptions {
+  upstreamUrl: string;
+  method: "GET" | "POST";
+  authorization: string;
+  stream: boolean;
+  body?: string;
+}
+
+interface UpstreamAttemptResult {
+  response: Response | null;
+  errorMessage: string | null;
+}
+
+interface RandomHeaderProfile {
+  userAgent: string;
+  acceptEncoding: string;
+  acceptLanguage: string;
+  secChUa: string;
+  secChUaMobile: string;
+  secChUaPlatform: string;
+  secFetchDest: string;
+  secFetchMode: string;
+  secFetchSite: string;
+  priority: string;
+  httpReferer: string;
+  xTitle: string;
+}
+
+async function fetchUpstreamWithRetry(env: Env, options: UpstreamFetchOptions): Promise<Response> {
+  const firstAttempt = await fetchUpstreamOnce(env, options, false);
+  if (isUsableUpstreamResponse(firstAttempt.response, options.stream)) {
+    return firstAttempt.response as Response;
+  }
+
+  const secondAttempt = await fetchUpstreamOnce(env, options, true);
+  if (secondAttempt.response) {
+    return secondAttempt.response;
+  }
+  if (firstAttempt.response) {
+    return firstAttempt.response;
+  }
+
+  const details = [firstAttempt.errorMessage, secondAttempt.errorMessage]
+    .filter((item): item is string => Boolean(item && item.trim().length > 0))
+    .join("; ");
+  throw new Error(details.length > 0 ? details : "Both upstream attempts failed.");
+}
+
+async function fetchUpstreamOnce(
+  env: Env,
+  options: UpstreamFetchOptions,
+  useRandomizedHeaders: boolean,
+): Promise<UpstreamAttemptResult> {
+  const headers = buildUpstreamHeaders(env, options.authorization, options.stream, useRandomizedHeaders);
+  try {
+    const response = await fetch(options.upstreamUrl, {
+      method: options.method,
+      headers,
+      body: options.body,
+      redirect: "follow",
+    });
+    return { response, errorMessage: null };
+  } catch (error) {
+    return {
+      response: null,
+      errorMessage: `Attempt ${useRandomizedHeaders ? "2" : "1"} failed: ${getErrorMessage(error)}`,
+    };
+  }
+}
+
+function isUsableUpstreamResponse(response: Response | null, stream: boolean): boolean {
+  if (!response || !response.ok) {
+    return false;
+  }
+  if (!stream) {
+    return true;
+  }
+  const contentType = response.headers.get("content-type") ?? "";
+  return contentType.includes("text/event-stream");
+}
+
 function buildUpstreamHeaders(
-  request: Request,
   env: Env,
   authorization: string,
   stream: boolean,
+  useRandomizedHeaders: boolean,
 ): Headers {
   const headers = new Headers();
+  const randomProfile = useRandomizedHeaders ? buildRandomHeaderProfile() : null;
+
   headers.set("authorization", authorization);
   headers.set("content-type", "application/json");
-  headers.set("accept", pickOutgoingAccept(request, env, stream));
-  headers.set("accept-encoding", pickOutgoingAcceptEncoding(request, env));
-  headers.set("user-agent", pickOutgoingUserAgent(request, env));
-  headers.set("accept-language", pickOutgoingAcceptLanguage(request, env));
-  headers.set("http-referer", pickOutgoingHttpReferer(request, env));
-  headers.set("x-title", pickOutgoingXTitle(request, env));
+  headers.set("accept", stream ? "text/event-stream" : pickConfiguredOrDefault(env.OUTBOUND_ACCEPT, DEFAULT_ACCEPT));
+  headers.set(
+    "accept-encoding",
+    randomProfile?.acceptEncoding ??
+      pickConfiguredOrDefault(env.OUTBOUND_ACCEPT_ENCODING, DEFAULT_ACCEPT_ENCODING),
+  );
+  headers.set(
+    "user-agent",
+    randomProfile?.userAgent ?? pickConfiguredOrDefault(env.OUTBOUND_USER_AGENT, DEFAULT_USER_AGENT),
+  );
+  headers.set(
+    "accept-language",
+    randomProfile?.acceptLanguage ??
+      pickConfiguredOrDefault(env.OUTBOUND_ACCEPT_LANGUAGE, DEFAULT_ACCEPT_LANGUAGE),
+  );
+  headers.set(
+    "http-referer",
+    randomProfile?.httpReferer ??
+      pickConfiguredOrDefault(env.OUTBOUND_HTTP_REFERER, DEFAULT_HTTP_REFERER),
+  );
+  headers.set(
+    "x-title",
+    randomProfile?.xTitle ?? pickConfiguredOrDefault(env.OUTBOUND_X_TITLE, DEFAULT_X_TITLE),
+  );
 
   if (normalizeBooleanWithDefault(env.FORWARD_BROWSER_HINT_HEADERS, true)) {
-    headers.set("sec-ch-ua", pickOutgoingSecChUa(request, env));
-    headers.set("sec-ch-ua-mobile", pickOutgoingSecChUaMobile(request, env));
-    headers.set("sec-ch-ua-platform", pickOutgoingSecChUaPlatform(request, env));
-    headers.set("sec-fetch-dest", pickOutgoingSecFetchDest(request, env));
-    headers.set("sec-fetch-mode", pickOutgoingSecFetchMode(request, env));
-    headers.set("sec-fetch-site", pickOutgoingSecFetchSite(request, env));
-    headers.set("priority", pickOutgoingPriority(request, env));
+    headers.set("sec-ch-ua", randomProfile?.secChUa ?? pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA, DEFAULT_SEC_CH_UA));
+    headers.set(
+      "sec-ch-ua-mobile",
+      randomProfile?.secChUaMobile ??
+        pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA_MOBILE, DEFAULT_SEC_CH_UA_MOBILE),
+    );
+    headers.set(
+      "sec-ch-ua-platform",
+      randomProfile?.secChUaPlatform ??
+        pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA_PLATFORM, DEFAULT_SEC_CH_UA_PLATFORM),
+    );
+    headers.set(
+      "sec-fetch-dest",
+      randomProfile?.secFetchDest ??
+        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_DEST, DEFAULT_SEC_FETCH_DEST),
+    );
+    headers.set(
+      "sec-fetch-mode",
+      randomProfile?.secFetchMode ??
+        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_MODE, DEFAULT_SEC_FETCH_MODE),
+    );
+    headers.set(
+      "sec-fetch-site",
+      randomProfile?.secFetchSite ??
+        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_SITE, DEFAULT_SEC_FETCH_SITE),
+    );
+    headers.set(
+      "priority",
+      randomProfile?.priority ?? pickConfiguredOrDefault(env.OUTBOUND_PRIORITY, DEFAULT_PRIORITY),
+    );
   }
 
-  const xApiKey = pickOutgoingXApiKey(request, env, authorization);
+  const xApiKey = pickOutgoingXApiKey(env, authorization);
   if (xApiKey) {
     headers.set("x-api-key", xApiKey);
-  }
-
-  const organization = request.headers.get("openai-organization");
-  if (organization) {
-    headers.set("openai-organization", organization);
-  }
-
-  const project = request.headers.get("openai-project");
-  if (project) {
-    headers.set("openai-project", project);
   }
 
   for (const [key, value] of parseExtraHeaders(env.OUTBOUND_EXTRA_HEADERS)) {
@@ -368,55 +514,73 @@ function buildUpstreamHeaders(
   return headers;
 }
 
-function pickOutgoingAccept(request: Request, env: Env, stream: boolean): string {
-  if (stream) {
-    return "text/event-stream";
+function pickConfiguredOrDefault(configuredValue: string | undefined, fallbackValue: string): string {
+  if (configuredValue && configuredValue.trim().length > 0) {
+    return configuredValue.trim();
   }
-  const forwardClientAccept = normalizeBooleanWithDefault(env.FORWARD_CLIENT_ACCEPT, true);
-  const inbound = request.headers.get("accept");
-  if (forwardClientAccept && inbound && inbound.trim().length > 0) {
-    return inbound;
-  }
-  if (env.OUTBOUND_ACCEPT && env.OUTBOUND_ACCEPT.trim().length > 0) {
-    return env.OUTBOUND_ACCEPT.trim();
-  }
-  return DEFAULT_ACCEPT;
+  return fallbackValue;
 }
 
-function pickOutgoingAcceptEncoding(request: Request, env: Env): string {
-  const forward = normalizeBooleanWithDefault(env.FORWARD_CLIENT_ACCEPT_ENCODING, true);
-  const inbound = request.headers.get("accept-encoding");
-  if (forward && inbound && inbound.trim().length > 0) {
-    return inbound;
+function pickOutgoingXApiKey(env: Env, authorization: string): string | null {
+  if (!normalizeBooleanWithDefault(env.FORWARD_X_API_KEY, true)) {
+    return null;
   }
-  if (env.OUTBOUND_ACCEPT_ENCODING && env.OUTBOUND_ACCEPT_ENCODING.trim().length > 0) {
-    return env.OUTBOUND_ACCEPT_ENCODING.trim();
-  }
-  return DEFAULT_ACCEPT_ENCODING;
+  return extractBearerToken(authorization);
 }
 
-function pickOutgoingUserAgent(request: Request, env: Env): string {
-  const forwardClientUa = normalizeBooleanWithDefault(env.FORWARD_CLIENT_UA, true);
-  const inboundUa = request.headers.get("user-agent");
-  if (forwardClientUa && inboundUa && inboundUa.trim().length > 0) {
-    return inboundUa;
+function extractBearerToken(authorization: string): string | null {
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return null;
   }
-  if (env.OUTBOUND_USER_AGENT && env.OUTBOUND_USER_AGENT.trim().length > 0) {
-    return env.OUTBOUND_USER_AGENT.trim();
-  }
-  return DEFAULT_USER_AGENT;
+  const token = match[1].trim();
+  return token.length > 0 ? token : null;
 }
 
-function pickOutgoingAcceptLanguage(request: Request, env: Env): string {
-  const forwardAcceptLanguage = normalizeBooleanWithDefault(env.FORWARD_ACCEPT_LANGUAGE, true);
-  const inbound = request.headers.get("accept-language");
-  if (forwardAcceptLanguage && inbound && inbound.trim().length > 0) {
-    return inbound;
-  }
-  if (env.OUTBOUND_ACCEPT_LANGUAGE && env.OUTBOUND_ACCEPT_LANGUAGE.trim().length > 0) {
-    return env.OUTBOUND_ACCEPT_LANGUAGE.trim();
-  }
-  return DEFAULT_ACCEPT_LANGUAGE;
+function buildRandomHeaderProfile(): RandomHeaderProfile {
+  const uaProfiles = [
+    {
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\", \"Google Chrome\";v=\"140\"",
+      secChUaPlatform: "\"Windows\"",
+    },
+    {
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"139\", \"Google Chrome\";v=\"139\"",
+      secChUaPlatform: "\"Linux\"",
+    },
+    {
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"141\", \"Google Chrome\";v=\"141\"",
+      secChUaPlatform: "\"macOS\"",
+    },
+  ];
+
+  const selected = randomFromArray(uaProfiles);
+  return {
+    userAgent: selected.userAgent,
+    acceptEncoding: randomFromArray(["gzip, deflate, br", "gzip, br", "gzip, deflate, br, zstd"]),
+    acceptLanguage: randomFromArray(["en-US,en;q=0.9", "zh-CN,zh;q=0.9,en;q=0.8", "ja-JP,ja;q=0.9,en;q=0.7"]),
+    secChUa: selected.secChUa,
+    secChUaMobile: "?0",
+    secChUaPlatform: selected.secChUaPlatform,
+    secFetchDest: randomFromArray(["empty", "document"]),
+    secFetchMode: randomFromArray(["cors", "navigate", "no-cors"]),
+    secFetchSite: randomFromArray(["cross-site", "same-site", "none"]),
+    priority: randomFromArray(["u=1, i", "u=0, i", "u=1"]),
+    httpReferer: randomFromArray(["https://cherry-ai.com", "https://platform.openai.com", "https://chat.openai.com"]),
+    xTitle: randomFromArray(["Cherry Studio", "Cline", "OpenAI Client"]),
+  };
+}
+
+function randomFromArray<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
 }
 
 function normalizeBooleanWithDefault(value: string | undefined, defaultValue: boolean): boolean {
@@ -431,137 +595,6 @@ function normalizeBooleanWithDefault(value: string | undefined, defaultValue: bo
     return false;
   }
   return defaultValue;
-}
-
-function pickOutgoingHttpReferer(request: Request, env: Env): string {
-  const inbound = request.headers.get("http-referer") ?? request.headers.get("referer");
-  if (inbound && inbound.trim().length > 0) {
-    return inbound;
-  }
-  if (env.OUTBOUND_HTTP_REFERER && env.OUTBOUND_HTTP_REFERER.trim().length > 0) {
-    return env.OUTBOUND_HTTP_REFERER.trim();
-  }
-  return DEFAULT_HTTP_REFERER;
-}
-
-function pickOutgoingXTitle(request: Request, env: Env): string {
-  const inbound = request.headers.get("x-title");
-  if (inbound && inbound.trim().length > 0) {
-    return inbound;
-  }
-  if (env.OUTBOUND_X_TITLE && env.OUTBOUND_X_TITLE.trim().length > 0) {
-    return env.OUTBOUND_X_TITLE.trim();
-  }
-  return DEFAULT_X_TITLE;
-}
-
-function pickOutgoingSecChUa(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-ch-ua",
-    env.OUTBOUND_SEC_CH_UA,
-    DEFAULT_SEC_CH_UA,
-  );
-}
-
-function pickOutgoingSecChUaMobile(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-ch-ua-mobile",
-    env.OUTBOUND_SEC_CH_UA_MOBILE,
-    DEFAULT_SEC_CH_UA_MOBILE,
-  );
-}
-
-function pickOutgoingSecChUaPlatform(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-ch-ua-platform",
-    env.OUTBOUND_SEC_CH_UA_PLATFORM,
-    DEFAULT_SEC_CH_UA_PLATFORM,
-  );
-}
-
-function pickOutgoingSecFetchDest(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-fetch-dest",
-    env.OUTBOUND_SEC_FETCH_DEST,
-    DEFAULT_SEC_FETCH_DEST,
-  );
-}
-
-function pickOutgoingSecFetchMode(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-fetch-mode",
-    env.OUTBOUND_SEC_FETCH_MODE,
-    DEFAULT_SEC_FETCH_MODE,
-  );
-}
-
-function pickOutgoingSecFetchSite(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "sec-fetch-site",
-    env.OUTBOUND_SEC_FETCH_SITE,
-    DEFAULT_SEC_FETCH_SITE,
-  );
-}
-
-function pickOutgoingPriority(request: Request, env: Env): string {
-  return pickInboundOrConfiguredHeader(
-    request,
-    "priority",
-    env.OUTBOUND_PRIORITY,
-    DEFAULT_PRIORITY,
-  );
-}
-
-function pickInboundOrConfiguredHeader(
-  request: Request,
-  headerName: string,
-  configuredValue: string | undefined,
-  fallbackValue: string,
-): string {
-  const inbound = request.headers.get(headerName);
-  if (inbound && inbound.trim().length > 0) {
-    return inbound;
-  }
-  if (configuredValue && configuredValue.trim().length > 0) {
-    return configuredValue.trim();
-  }
-  return fallbackValue;
-}
-
-function pickOutgoingXApiKey(
-  request: Request,
-  env: Env,
-  authorization: string,
-): string | null {
-  if (!normalizeBooleanWithDefault(env.FORWARD_X_API_KEY, true)) {
-    return null;
-  }
-
-  if (env.X_API_KEY_VALUE && env.X_API_KEY_VALUE.trim().length > 0) {
-    return env.X_API_KEY_VALUE.trim();
-  }
-
-  const inbound = request.headers.get("x-api-key");
-  if (inbound && inbound.trim().length > 0) {
-    return inbound.trim();
-  }
-
-  return extractBearerToken(authorization);
-}
-
-function extractBearerToken(authorization: string): string | null {
-  const match = authorization.match(/^Bearer\s+(.+)$/i);
-  if (!match) {
-    return null;
-  }
-  const token = match[1].trim();
-  return token.length > 0 ? token : null;
 }
 
 function parseExtraHeaders(raw: string | undefined): Array<[string, string]> {
@@ -587,21 +620,110 @@ function parseExtraHeaders(raw: string | undefined): Array<[string, string]> {
   }
 }
 
-function buildUpstreamUrl(baseUrl: string | undefined, path: string): string {
-  const normalizedBase = (baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_UPSTREAM_BASE)
-    .trim()
-    .replace(/\/+$/, "");
+function buildUpstreamUrl(baseUrl: string, path: string): string {
+  const normalizedBase = baseUrl.trim().replace(/\/+$/, "");
   if (normalizedBase.endsWith("/v1")) {
     return `${normalizedBase}${path.replace(/^\/v1/, "")}`;
   }
   return `${normalizedBase}${path}`;
 }
 
-function resolveUpstreamBaseUrl(env: Env): string | undefined {
-  if (env.OPENAI_BASE_URL && env.OPENAI_BASE_URL.trim().length > 0) {
-    return env.OPENAI_BASE_URL.trim();
+function resolveRequiredUpstreamBaseUrl(env: Env): string | null {
+  if (!env.OPENAI_BASE_URL || env.OPENAI_BASE_URL.trim().length === 0) {
+    return null;
   }
-  return env.UPSTREAM_BASE_URL;
+  return env.OPENAI_BASE_URL.trim();
+}
+
+async function mapUpstreamErrorResponse(
+  upstreamRes: Response,
+  corsHeaders: Headers,
+  upstreamUrl: string,
+): Promise<Response> {
+  const status = upstreamRes.status >= 400 ? upstreamRes.status : 502;
+  const contentType = (upstreamRes.headers.get("content-type") ?? "").toLowerCase();
+  const upstreamHost = safeHostFromUrl(upstreamUrl);
+
+  if (contentType.includes("application/json")) {
+    try {
+      const parsed = (await upstreamRes.json()) as unknown;
+      const upstreamMessage = extractUpstreamJsonErrorMessage(parsed);
+      return jsonResponse(
+        {
+          error: {
+            message:
+              upstreamMessage ??
+              `Upstream request failed: ${status}${upstreamHost ? ` from ${upstreamHost}` : ""}.`,
+            type: "upstream_error",
+            upstream_status: status,
+          },
+        },
+        status,
+        corsHeaders,
+      );
+    } catch {
+      // Fall through to plain-text summarization below.
+    }
+  }
+
+  let bodyText = "";
+  try {
+    bodyText = await upstreamRes.text();
+  } catch {
+    bodyText = "";
+  }
+  const bodySummary = summarizeUpstreamErrorBody(bodyText);
+
+  return jsonResponse(
+    {
+      error: {
+        message:
+          bodySummary.length > 0
+            ? `Upstream request failed: ${status}${upstreamHost ? ` from ${upstreamHost}` : ""}. ${bodySummary}`
+            : `Upstream request failed: ${status}${upstreamHost ? ` from ${upstreamHost}` : ""}.`,
+        type: "upstream_error",
+        upstream_status: status,
+      },
+    },
+    status,
+    corsHeaders,
+  );
+}
+
+function extractUpstreamJsonErrorMessage(payload: unknown): string | null {
+  if (!isObject(payload)) {
+    return null;
+  }
+  if (isObject(payload.error) && typeof payload.error.message === "string") {
+    return payload.error.message;
+  }
+  if (typeof payload.message === "string") {
+    return payload.message;
+  }
+  return null;
+}
+
+function summarizeUpstreamErrorBody(rawBody: string): string {
+  const trimmed = rawBody.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  if (trimmed.toLowerCase().includes("<html")) {
+    return "Upstream returned an HTML error page (likely proxy/CDN host failure).";
+  }
+  const compact = trimmed.replace(/\s+/g, " ");
+  if (compact.length <= 240) {
+    return `Body: ${compact}`;
+  }
+  return `Body: ${compact.slice(0, 240)}...`;
+}
+
+function safeHostFromUrl(rawUrl: string): string | null {
+  try {
+    return new URL(rawUrl).host;
+  } catch {
+    return null;
+  }
 }
 
 function chatToResponsesPayload(chatRequest: ChatCompletionRequest): JsonObject {
@@ -643,10 +765,6 @@ function chatToResponsesPayload(chatRequest: ChatCompletionRequest): JsonObject 
   const text = mapResponseFormat(chatRequest.response_format);
   if (text !== undefined) {
     payload.text = text;
-  }
-
-  if (typeof chatRequest.user === "string" && chatRequest.user.length > 0) {
-    payload.metadata = { client_user: chatRequest.user };
   }
 
   return payload;

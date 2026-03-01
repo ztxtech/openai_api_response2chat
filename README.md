@@ -19,13 +19,13 @@
 ## 出站策略（当前版本）
 
 - 不透传任何发起端请求头到上游（统一由 Worker 端生成请求头）。
-- 认证仅使用 Worker Secret `OPENAI_API_KEY`，不接受客户端 `Authorization` 回退。
+- 认证仅使用发起端提供的 secret（`Authorization` 或 `x-api-key`）。
 - 上游访问失败时会自动进行一次二次重试，并使用随机化请求头模板。
 - 不配置账号/网关回退，不使用备用上游地址。
 
 ## Cloudflare 部署（GitHub 自动构建，推荐）
 
-以下流程按你截图中的场景编写：代码从 GitHub 导入，配置在 Cloudflare 面板填写，密钥由发起部署的终端写入 secret。
+以下流程按你截图中的场景编写：代码从 GitHub 导入，配置在 Cloudflare 面板填写，密钥由发起端请求头传入。
 
 ### 1) 准备 GitHub 仓库
 
@@ -55,7 +55,7 @@ workers_dev = true
    - 版本命令（如果界面有该项）：`npx wrangler versions upload`
    - 根目录：`/`
 
-### 3) 在“变量和机密”里配置 Base（变量）
+### 3) 在“变量和机密”里配置变量
 
 在 Cloudflare Worker 的 `变量和机密` 面板中，至少添加以下变量：
 
@@ -64,34 +64,24 @@ workers_dev = true
 说明：
 
 - 这是必填变量名，不再支持旧变量回退。
-- Worker 默认屏蔽所有客户端请求头（不透传 `Authorization/x-api-key/user-agent/accept/referer/sec-*` 等）。
-- 不要把 `OPENAI_API_KEY` 填在普通变量里。
+- Worker 默认屏蔽所有客户端请求头，但会读取客户端 secret（`Authorization/x-api-key`）用于上游鉴权。
 
-### 4) Secret 由发起终端定义（关键步骤）
+### 4) 客户端侧传 secret（关键步骤）
 
-在你发起部署的终端执行（本地或 CI 均可）：
+不需要在 Worker 配置任何 `OPENAI_API_KEY` secret。  
+请在发起端（例如 Cline/Cherry Studio/你的 SDK）设置 API Key，并确保请求包含其一：
 
 ```bash
-npm install
-npx wrangler login
-npx wrangler whoami
-npx wrangler secret put OPENAI_API_KEY --name response2chat
+-H "Authorization: Bearer <YOUR_OPENAI_KEY>"
 ```
 
-执行最后一条命令时，终端会提示输入你的 OpenAI Key（不会回显）。
-
-如果你在 CI 或无交互终端中执行，先注入 Cloudflare 凭据再执行 `secret put`：
-
 ```powershell
-$env:CLOUDFLARE_API_TOKEN="你的 Cloudflare API Token"
-$env:CLOUDFLARE_ACCOUNT_ID="你的 Account ID"
-npx wrangler secret put OPENAI_API_KEY --name response2chat
+-H "x-api-key: <YOUR_OPENAI_KEY>"
 ```
 
 注意：
 
-- `--name` 必须与 `wrangler.toml` 的 `name` 一致。
-- 必须设置 `OPENAI_API_KEY` secret（不会接受客户端 `Authorization` 作为回退）。
+- Worker 不保存你的 Key；Key 只由发起端携带。
 
 ### 5) 触发部署
 
@@ -109,7 +99,8 @@ curl -i https://<你的worker域名>/
 模型列表：
 
 ```bash
-curl -i https://<你的worker域名>/v1/models
+curl -i https://<你的worker域名>/v1/models \
+  -H "Authorization: Bearer <YOUR_OPENAI_KEY>"
 ```
 
 聊天接口：
@@ -117,6 +108,7 @@ curl -i https://<你的worker域名>/v1/models
 ```bash
 curl -i https://<你的worker域名>/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <YOUR_OPENAI_KEY>" \
   -d '{
     "model": "gpt-4.1-mini",
     "messages": [{"role":"user","content":"hello"}]
@@ -128,7 +120,6 @@ curl -i https://<你的worker域名>/v1/chat/completions \
 推荐优先配置：
 
 - `OPENAI_BASE_URL`：上游 API Base（推荐）
-- `OPENAI_API_KEY`：Worker Secret（推荐）
 
 兼容与可选配置：
 
@@ -161,7 +152,7 @@ curl -i https://<你的worker域名>/v1/chat/completions \
 1. API Base 填 Worker 地址，例如：`https://xxx.your-subdomain.workers.dev`
 2. 模型列表走 `GET /v1/models`，可直接读取上游模型
 3. 聊天走 `POST /v1/chat/completions`，内部自动转为 `Responses API`
-4. Cline/代理链路场景下，不需要传 `Authorization`，只需保证 Worker secret 中已设置 `OPENAI_API_KEY`
+4. Cline/代理链路场景下，需要在客户端配置 API Key，让请求带上 `Authorization` 或 `x-api-key`
 
 ## 当前映射范围（说明）
 
@@ -178,9 +169,9 @@ curl -i https://<你的worker域名>/v1/chat/completions \
 1. 构建页提示 `请更新仓库中的 wrangler.toml`：
    - 原因：`wrangler.toml` 的 `name` 与 Cloudflare Worker 名不一致。
    - 处理：改成一致后重新推送。
-2. 返回 `Missing OPENAI_API_KEY secret in Worker`：
-   - 原因：未设置 `OPENAI_API_KEY` secret（当前版本不接受客户端 `Authorization` 回退）。
-   - 处理：在终端执行 `wrangler secret put OPENAI_API_KEY --name <worker-name>`。
+2. 返回 `Missing client secret. Provide Authorization: Bearer <token>.`：
+   - 原因：发起端没有携带 `Authorization` 或 `x-api-key`。
+   - 处理：在客户端配置 API Key，并确认请求头中带上 secret。
 3. 返回 `502` 且 body 是 Cloudflare HTML 页面：
    - 原因：上游主机本身故障（例如你的 `OPENAI_BASE_URL` 指向的域名返回 5xx）。
    - 处理：Worker 会自动二次重试一次随机头模板；若仍失败，请检查 `OPENAI_BASE_URL` 指向的上游可用性与区域连通性。

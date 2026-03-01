@@ -1,5 +1,4 @@
 interface Env {
-  OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
   OUTBOUND_ACCEPT?: string;
   OUTBOUND_USER_AGENT?: string;
@@ -110,13 +109,12 @@ async function proxyModels(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(env);
+  const authHeader = resolveAuthorization(request);
   if (!authHeader) {
     return jsonResponse(
       {
         error: {
-          message:
-            "Missing OPENAI_API_KEY secret in Worker.",
+          message: "Missing client secret. Provide Authorization: Bearer <token>.",
           type: "invalid_request_error",
         },
       },
@@ -171,13 +169,12 @@ async function handleChatCompletions(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(env);
+  const authHeader = resolveAuthorization(request);
   if (!authHeader) {
     return jsonResponse(
       {
         error: {
-          message:
-            "Missing OPENAI_API_KEY secret in Worker.",
+          message: "Missing client secret. Provide Authorization: Bearer <token>.",
           type: "invalid_request_error",
         },
       },
@@ -342,9 +339,14 @@ async function handleChatCompletions(
   return convertResponsesStreamToChatStream(upstreamRes, chatRequest, corsHeaders);
 }
 
-function resolveAuthorization(env: Env): string | null {
-  if (env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0) {
-    return `Bearer ${env.OPENAI_API_KEY.trim()}`;
+function resolveAuthorization(request: Request): string | null {
+  const inboundAuthorization = request.headers.get("authorization");
+  if (inboundAuthorization && inboundAuthorization.trim().length > 0) {
+    return inboundAuthorization.trim();
+  }
+  const inboundXApiKey = request.headers.get("x-api-key");
+  if (inboundXApiKey && inboundXApiKey.trim().length > 0) {
+    return `Bearer ${inboundXApiKey.trim()}`;
   }
   return null;
 }
@@ -1558,7 +1560,7 @@ function buildCorsHeaders(request: Request, env: Env): Headers {
   headers.set("access-control-allow-origin", allowOrigin);
   headers.set(
     "access-control-allow-headers",
-    "authorization,content-type,openai-organization,openai-project",
+    "authorization,x-api-key,content-type",
   );
   headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
   headers.set("access-control-max-age", "86400");

@@ -1,0 +1,15 @@
+name = "openai-chat-responses-adapter"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+workers_dev = true
+
+[vars]
+UPSTREAM_BASE_URL = "https://api.openai.com"
+FORWARD_CLIENT_UA = "true"
+FORWARD_ACCEPT_LANGUAGE = "true"
+FORWARD_CLIENT_ACCEPT = "true"
+FORWARD_CLIENT_ACCEPT_ENCODING = "true"
+FORWARD_BROWSER_HINT_HEADERS = "true"
+FORWARD_X_API_KEY = "true"
+OUTBOUND_HTTP_REFERER = "https://cherry-ai.com"
+OUTBOUND_X_TITLE = "Cherry Studio"

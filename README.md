@@ -21,6 +21,8 @@
 - 不透传任何发起端请求头到上游（统一由 Worker 端生成请求头）。
 - 认证仅使用发起端提供的 secret（`Authorization` 或 `x-api-key`）。
 - 上游访问失败时会自动进行一次二次重试，并使用随机化请求头模板。
+- 会透传部分上游响应头到客户端（如 `cf-ray/cf-cache-status/alt-svc/server/cache-control`）便于排障。
+- 502 JSON 与流式响应默认使用“上一次调用缓存的上游响应头”；首次无缓存时使用当前上游头。
 - 不配置账号/网关回退，不使用备用上游地址。
 
 ## Cloudflare 部署（GitHub 自动构建，推荐）

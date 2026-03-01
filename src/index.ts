@@ -61,6 +61,20 @@ const DEFAULT_SEC_FETCH_DEST = "empty";
 const DEFAULT_SEC_FETCH_MODE = "cors";
 const DEFAULT_SEC_FETCH_SITE = "cross-site";
 const DEFAULT_PRIORITY = "u=1, i";
+const FORWARDED_UPSTREAM_RESPONSE_HEADERS = [
+  "alt-svc",
+  "cache-control",
+  "cf-cache-status",
+  "cf-ray",
+  "date",
+  "nel",
+  "referrer-policy",
+  "report-to",
+  "server",
+  "x-content-type-options",
+  "x-frame-options",
+];
+const LAST_UPSTREAM_HEADERS_BY_HOST = new Map<string, Map<string, string>>();
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -149,6 +163,7 @@ async function proxyModels(
     if (!upstreamRes.ok) {
       return mapUpstreamErrorResponse(upstreamRes, corsHeaders, upstreamUrl);
     }
+    rememberSelectedUpstreamResponseHeadersByUrl(upstreamUrl, upstreamRes.headers);
     return withCors(upstreamRes, corsHeaders);
   } catch (error) {
     return jsonResponse(
@@ -298,6 +313,7 @@ async function handleChatCompletions(
     if (!upstreamRes.ok) {
       return mapUpstreamErrorResponse(upstreamRes, corsHeaders, upstreamUrl);
     }
+    rememberSelectedUpstreamResponseHeadersByUrl(upstreamUrl, upstreamRes.headers);
 
     let responsesBody: JsonObject;
     try {
@@ -336,7 +352,7 @@ async function handleChatCompletions(
     );
   }
 
-  return convertResponsesStreamToChatStream(upstreamRes, chatRequest, corsHeaders);
+  return convertResponsesStreamToChatStream(upstreamRes, chatRequest, corsHeaders, upstreamUrl);
 }
 
 function resolveAuthorization(request: Request): string | null {
@@ -650,7 +666,7 @@ async function mapUpstreamErrorResponse(
     try {
       const parsed = (await upstreamRes.json()) as unknown;
       const upstreamMessage = extractUpstreamJsonErrorMessage(parsed);
-      return jsonResponse(
+      return jsonResponseWithUpstreamHeaders(
         {
           error: {
             message:
@@ -662,6 +678,8 @@ async function mapUpstreamErrorResponse(
         },
         status,
         corsHeaders,
+        upstreamRes.headers,
+        upstreamUrl,
       );
     } catch {
       // Fall through to plain-text summarization below.
@@ -676,7 +694,7 @@ async function mapUpstreamErrorResponse(
   }
   const bodySummary = summarizeUpstreamErrorBody(bodyText);
 
-  return jsonResponse(
+  return jsonResponseWithUpstreamHeaders(
     {
       error: {
         message:
@@ -689,6 +707,8 @@ async function mapUpstreamErrorResponse(
     },
     status,
     corsHeaders,
+    upstreamRes.headers,
+    upstreamUrl,
   );
 }
 
@@ -1167,6 +1187,7 @@ async function convertResponsesStreamToChatStream(
   upstreamRes: Response,
   originalRequest: ChatCompletionRequest,
   corsHeaders: Headers,
+  upstreamUrl: string,
 ): Promise<Response> {
   if (!upstreamRes.body) {
     return jsonResponse(
@@ -1473,6 +1494,7 @@ async function convertResponsesStreamToChatStream(
   void pump();
 
   const streamHeaders = new Headers();
+  copySelectedUpstreamResponseHeaders(streamHeaders, upstreamRes.headers, upstreamUrl);
   streamHeaders.set("content-type", "text/event-stream; charset=utf-8");
   streamHeaders.set("cache-control", "no-cache, no-transform");
   streamHeaders.set("connection", "keep-alive");
@@ -1529,6 +1551,19 @@ function jsonResponse(body: unknown, status: number, corsHeaders: Headers): Resp
   return new Response(JSON.stringify(body), { status, headers });
 }
 
+function jsonResponseWithUpstreamHeaders(
+  body: unknown,
+  status: number,
+  corsHeaders: Headers,
+  upstreamHeaders: Headers,
+  upstreamUrl: string,
+): Response {
+  const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+  copySelectedUpstreamResponseHeaders(headers, upstreamHeaders, upstreamUrl);
+  applyCorsToHeaders(headers, corsHeaders);
+  return new Response(JSON.stringify(body), { status, headers });
+}
+
 function withCors(response: Response, corsHeaders: Headers): Response {
   const headers = new Headers(response.headers);
   applyCorsToHeaders(headers, corsHeaders);
@@ -1537,6 +1572,61 @@ function withCors(response: Response, corsHeaders: Headers): Response {
     statusText: response.statusText,
     headers,
   });
+}
+
+function copySelectedUpstreamResponseHeaders(
+  target: Headers,
+  upstream: Headers,
+  upstreamUrl: string,
+): void {
+  const upstreamHost = safeHostFromUrl(upstreamUrl);
+  if (upstreamHost) {
+    const previous = LAST_UPSTREAM_HEADERS_BY_HOST.get(upstreamHost);
+    if (previous && previous.size > 0) {
+      for (const [key, value] of previous.entries()) {
+        target.set(key, value);
+      }
+    } else {
+      copyCurrentSelectedUpstreamHeaders(target, upstream);
+    }
+    rememberSelectedUpstreamResponseHeaders(upstreamHost, upstream);
+    return;
+  }
+
+  copyCurrentSelectedUpstreamHeaders(target, upstream);
+}
+
+function copyCurrentSelectedUpstreamHeaders(target: Headers, upstream: Headers): void {
+  for (const headerName of FORWARDED_UPSTREAM_RESPONSE_HEADERS) {
+    const value = upstream.get(headerName);
+    if (value && value.trim().length > 0) {
+      target.set(headerName, value);
+    }
+  }
+}
+
+function rememberSelectedUpstreamResponseHeadersByUrl(
+  upstreamUrl: string,
+  upstreamHeaders: Headers,
+): void {
+  const upstreamHost = safeHostFromUrl(upstreamUrl);
+  if (!upstreamHost) {
+    return;
+  }
+  rememberSelectedUpstreamResponseHeaders(upstreamHost, upstreamHeaders);
+}
+
+function rememberSelectedUpstreamResponseHeaders(upstreamHost: string, upstreamHeaders: Headers): void {
+  const existing = LAST_UPSTREAM_HEADERS_BY_HOST.get(upstreamHost) ?? new Map<string, string>();
+  for (const headerName of FORWARDED_UPSTREAM_RESPONSE_HEADERS) {
+    const value = upstreamHeaders.get(headerName);
+    if (value && value.trim().length > 0) {
+      existing.set(headerName, value);
+    }
+  }
+  if (existing.size > 0) {
+    LAST_UPSTREAM_HEADERS_BY_HOST.set(upstreamHost, existing);
+  }
 }
 
 function buildCorsHeaders(request: Request, env: Env): Headers {

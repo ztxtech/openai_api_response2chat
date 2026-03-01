@@ -5,7 +5,3 @@ workers_dev = true
 
 [vars]
 OPENAI_BASE_URL = "https://api.openai.com"
-FORWARD_BROWSER_HINT_HEADERS = "true"
-FORWARD_X_API_KEY = "true"
-OUTBOUND_HTTP_REFERER = "https://cherry-ai.com"
-OUTBOUND_X_TITLE = "Cherry Studio"

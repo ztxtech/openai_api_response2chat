@@ -1,21 +1,5 @@
 interface Env {
   OPENAI_BASE_URL?: string;
-  OUTBOUND_ACCEPT?: string;
-  OUTBOUND_USER_AGENT?: string;
-  OUTBOUND_ACCEPT_ENCODING?: string;
-  OUTBOUND_ACCEPT_LANGUAGE?: string;
-  OUTBOUND_HTTP_REFERER?: string;
-  OUTBOUND_X_TITLE?: string;
-  OUTBOUND_SEC_CH_UA?: string;
-  OUTBOUND_SEC_CH_UA_MOBILE?: string;
-  OUTBOUND_SEC_CH_UA_PLATFORM?: string;
-  OUTBOUND_SEC_FETCH_DEST?: string;
-  OUTBOUND_SEC_FETCH_MODE?: string;
-  OUTBOUND_SEC_FETCH_SITE?: string;
-  OUTBOUND_PRIORITY?: string;
-  OUTBOUND_EXTRA_HEADERS?: string;
-  FORWARD_BROWSER_HINT_HEADERS?: string;
-  FORWARD_X_API_KEY?: string;
   ALLOWED_ORIGINS?: string;
 }
 
@@ -46,21 +30,6 @@ interface ToolCall {
   };
 }
 
-const DEFAULT_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) CherryStudio/1.7.21 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36";
-const DEFAULT_ACCEPT = "*/*";
-const DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd";
-const DEFAULT_ACCEPT_LANGUAGE = "zh-CN";
-const DEFAULT_HTTP_REFERER = "https://cherry-ai.com";
-const DEFAULT_X_TITLE = "Cherry Studio";
-const DEFAULT_SEC_CH_UA = "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\"";
-const DEFAULT_SEC_CH_UA_MOBILE = "?0";
-const DEFAULT_SEC_CH_UA_PLATFORM = "\"Windows\"";
-const DEFAULT_SEC_FETCH_DEST = "empty";
-const DEFAULT_SEC_FETCH_MODE = "cors";
-const DEFAULT_SEC_FETCH_SITE = "cross-site";
-const DEFAULT_PRIORITY = "u=1, i";
 const FORWARDED_UPSTREAM_RESPONSE_HEADERS = [
   "alt-svc",
   "cache-control",
@@ -75,6 +44,24 @@ const FORWARDED_UPSTREAM_RESPONSE_HEADERS = [
   "x-frame-options",
 ];
 const LAST_UPSTREAM_HEADERS_BY_HOST = new Map<string, Map<string, string>>();
+const SKIPPED_INBOUND_REQUEST_HEADERS = new Set([
+  "host",
+  "content-length",
+  "connection",
+  "transfer-encoding",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "upgrade",
+  "cf-connecting-ip",
+  "cf-ipcountry",
+  "cf-ray",
+  "cf-visitor",
+  "x-forwarded-proto",
+  "x-real-ip",
+]);
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -123,12 +110,11 @@ async function proxyModels(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(request);
-  if (!authHeader) {
+  if (!hasClientSecret(request)) {
     return jsonResponse(
       {
         error: {
-          message: "Missing client secret. Provide Authorization: Bearer <token>.",
+          message: "Missing client secret. Provide Authorization: Bearer <token> or x-api-key.",
           type: "invalid_request_error",
         },
       },
@@ -154,10 +140,10 @@ async function proxyModels(
   const upstreamUrl = buildUpstreamUrl(upstreamBaseUrl, "/v1/models");
 
   try {
-    const upstreamRes = await fetchUpstreamWithRetry(env, {
+    const upstreamRes = await fetchUpstream({
       upstreamUrl,
       method: "GET",
-      authorization: authHeader,
+      request,
       stream: false,
     });
     if (!upstreamRes.ok) {
@@ -184,12 +170,11 @@ async function handleChatCompletions(
   env: Env,
   corsHeaders: Headers,
 ): Promise<Response> {
-  const authHeader = resolveAuthorization(request);
-  if (!authHeader) {
+  if (!hasClientSecret(request)) {
     return jsonResponse(
       {
         error: {
-          message: "Missing client secret. Provide Authorization: Bearer <token>.",
+          message: "Missing client secret. Provide Authorization: Bearer <token> or x-api-key.",
           type: "invalid_request_error",
         },
       },
@@ -289,10 +274,10 @@ async function handleChatCompletions(
 
   let upstreamRes: Response;
   try {
-    upstreamRes = await fetchUpstreamWithRetry(env, {
+    upstreamRes = await fetchUpstream({
       upstreamUrl,
       method: "POST",
-      authorization: authHeader,
+      request,
       stream,
       body: JSON.stringify(responsesPayload),
     });
@@ -355,287 +340,56 @@ async function handleChatCompletions(
   return convertResponsesStreamToChatStream(upstreamRes, chatRequest, corsHeaders, upstreamUrl);
 }
 
-function resolveAuthorization(request: Request): string | null {
+function hasClientSecret(request: Request): boolean {
   const inboundAuthorization = request.headers.get("authorization");
   if (inboundAuthorization && inboundAuthorization.trim().length > 0) {
-    return inboundAuthorization.trim();
+    return true;
   }
   const inboundXApiKey = request.headers.get("x-api-key");
-  if (inboundXApiKey && inboundXApiKey.trim().length > 0) {
-    return `Bearer ${inboundXApiKey.trim()}`;
-  }
-  return null;
+  return Boolean(inboundXApiKey && inboundXApiKey.trim().length > 0);
 }
 
 interface UpstreamFetchOptions {
   upstreamUrl: string;
   method: "GET" | "POST";
-  authorization: string;
+  request: Request;
   stream: boolean;
   body?: string;
 }
 
-interface UpstreamAttemptResult {
-  response: Response | null;
-  errorMessage: string | null;
+async function fetchUpstream(options: UpstreamFetchOptions): Promise<Response> {
+  const headers = buildUpstreamHeadersFromRequest(options.request, options.stream);
+  return fetch(options.upstreamUrl, {
+    method: options.method,
+    headers,
+    body: options.body,
+    redirect: "follow",
+  });
 }
 
-interface RandomHeaderProfile {
-  userAgent: string;
-  acceptEncoding: string;
-  acceptLanguage: string;
-  secChUa: string;
-  secChUaMobile: string;
-  secChUaPlatform: string;
-  secFetchDest: string;
-  secFetchMode: string;
-  secFetchSite: string;
-  priority: string;
-  httpReferer: string;
-  xTitle: string;
-}
-
-async function fetchUpstreamWithRetry(env: Env, options: UpstreamFetchOptions): Promise<Response> {
-  const firstAttempt = await fetchUpstreamOnce(env, options, false);
-  if (isUsableUpstreamResponse(firstAttempt.response, options.stream)) {
-    return firstAttempt.response as Response;
-  }
-
-  const secondAttempt = await fetchUpstreamOnce(env, options, true);
-  if (secondAttempt.response) {
-    return secondAttempt.response;
-  }
-  if (firstAttempt.response) {
-    return firstAttempt.response;
-  }
-
-  const details = [firstAttempt.errorMessage, secondAttempt.errorMessage]
-    .filter((item): item is string => Boolean(item && item.trim().length > 0))
-    .join("; ");
-  throw new Error(details.length > 0 ? details : "Both upstream attempts failed.");
-}
-
-async function fetchUpstreamOnce(
-  env: Env,
-  options: UpstreamFetchOptions,
-  useRandomizedHeaders: boolean,
-): Promise<UpstreamAttemptResult> {
-  const headers = buildUpstreamHeaders(env, options.authorization, options.stream, useRandomizedHeaders);
-  try {
-    const response = await fetch(options.upstreamUrl, {
-      method: options.method,
-      headers,
-      body: options.body,
-      redirect: "follow",
-    });
-    return { response, errorMessage: null };
-  } catch (error) {
-    return {
-      response: null,
-      errorMessage: `Attempt ${useRandomizedHeaders ? "2" : "1"} failed: ${getErrorMessage(error)}`,
-    };
-  }
-}
-
-function isUsableUpstreamResponse(response: Response | null, stream: boolean): boolean {
-  if (!response || !response.ok) {
-    return false;
-  }
-  if (!stream) {
-    return true;
-  }
-  const contentType = response.headers.get("content-type") ?? "";
-  return contentType.includes("text/event-stream");
-}
-
-function buildUpstreamHeaders(
-  env: Env,
-  authorization: string,
+function buildUpstreamHeadersFromRequest(
+  request: Request,
   stream: boolean,
-  useRandomizedHeaders: boolean,
 ): Headers {
   const headers = new Headers();
-  const randomProfile = useRandomizedHeaders ? buildRandomHeaderProfile() : null;
-
-  headers.set("authorization", authorization);
-  headers.set("content-type", "application/json");
-  headers.set("accept", stream ? "text/event-stream" : pickConfiguredOrDefault(env.OUTBOUND_ACCEPT, DEFAULT_ACCEPT));
-  headers.set(
-    "accept-encoding",
-    randomProfile?.acceptEncoding ??
-      pickConfiguredOrDefault(env.OUTBOUND_ACCEPT_ENCODING, DEFAULT_ACCEPT_ENCODING),
-  );
-  headers.set(
-    "user-agent",
-    randomProfile?.userAgent ?? pickConfiguredOrDefault(env.OUTBOUND_USER_AGENT, DEFAULT_USER_AGENT),
-  );
-  headers.set(
-    "accept-language",
-    randomProfile?.acceptLanguage ??
-      pickConfiguredOrDefault(env.OUTBOUND_ACCEPT_LANGUAGE, DEFAULT_ACCEPT_LANGUAGE),
-  );
-  headers.set(
-    "http-referer",
-    randomProfile?.httpReferer ??
-      pickConfiguredOrDefault(env.OUTBOUND_HTTP_REFERER, DEFAULT_HTTP_REFERER),
-  );
-  headers.set(
-    "x-title",
-    randomProfile?.xTitle ?? pickConfiguredOrDefault(env.OUTBOUND_X_TITLE, DEFAULT_X_TITLE),
-  );
-
-  if (normalizeBooleanWithDefault(env.FORWARD_BROWSER_HINT_HEADERS, true)) {
-    headers.set("sec-ch-ua", randomProfile?.secChUa ?? pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA, DEFAULT_SEC_CH_UA));
-    headers.set(
-      "sec-ch-ua-mobile",
-      randomProfile?.secChUaMobile ??
-        pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA_MOBILE, DEFAULT_SEC_CH_UA_MOBILE),
-    );
-    headers.set(
-      "sec-ch-ua-platform",
-      randomProfile?.secChUaPlatform ??
-        pickConfiguredOrDefault(env.OUTBOUND_SEC_CH_UA_PLATFORM, DEFAULT_SEC_CH_UA_PLATFORM),
-    );
-    headers.set(
-      "sec-fetch-dest",
-      randomProfile?.secFetchDest ??
-        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_DEST, DEFAULT_SEC_FETCH_DEST),
-    );
-    headers.set(
-      "sec-fetch-mode",
-      randomProfile?.secFetchMode ??
-        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_MODE, DEFAULT_SEC_FETCH_MODE),
-    );
-    headers.set(
-      "sec-fetch-site",
-      randomProfile?.secFetchSite ??
-        pickConfiguredOrDefault(env.OUTBOUND_SEC_FETCH_SITE, DEFAULT_SEC_FETCH_SITE),
-    );
-    headers.set(
-      "priority",
-      randomProfile?.priority ?? pickConfiguredOrDefault(env.OUTBOUND_PRIORITY, DEFAULT_PRIORITY),
-    );
-  }
-
-  const xApiKey = pickOutgoingXApiKey(env, authorization);
-  if (xApiKey) {
-    headers.set("x-api-key", xApiKey);
-  }
-
-  for (const [key, value] of parseExtraHeaders(env.OUTBOUND_EXTRA_HEADERS)) {
-    if (key.toLowerCase() === "host" || key.toLowerCase() === "content-length") {
-      continue;
+  request.headers.forEach((value, key) => {
+    const normalizedKey = key.toLowerCase();
+    if (SKIPPED_INBOUND_REQUEST_HEADERS.has(normalizedKey)) {
+      return;
     }
     headers.set(key, value);
+  });
+  const inboundAuthorization = request.headers.get("authorization");
+  if (inboundAuthorization && inboundAuthorization.trim().length > 0) {
+    headers.set("authorization", inboundAuthorization.trim());
   }
-
+  if (stream) {
+    headers.set("accept", "text/event-stream");
+  }
+  if (!headers.has("content-type") && request.method === "POST") {
+    headers.set("content-type", "application/json");
+  }
   return headers;
-}
-
-function pickConfiguredOrDefault(configuredValue: string | undefined, fallbackValue: string): string {
-  if (configuredValue && configuredValue.trim().length > 0) {
-    return configuredValue.trim();
-  }
-  return fallbackValue;
-}
-
-function pickOutgoingXApiKey(env: Env, authorization: string): string | null {
-  if (!normalizeBooleanWithDefault(env.FORWARD_X_API_KEY, true)) {
-    return null;
-  }
-  return extractBearerToken(authorization);
-}
-
-function extractBearerToken(authorization: string): string | null {
-  const match = authorization.match(/^Bearer\s+(.+)$/i);
-  if (!match) {
-    return null;
-  }
-  const token = match[1].trim();
-  return token.length > 0 ? token : null;
-}
-
-function buildRandomHeaderProfile(): RandomHeaderProfile {
-  const uaProfiles = [
-    {
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\", \"Google Chrome\";v=\"140\"",
-      secChUaPlatform: "\"Windows\"",
-    },
-    {
-      userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"139\", \"Google Chrome\";v=\"139\"",
-      secChUaPlatform: "\"Linux\"",
-    },
-    {
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_7) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-      secChUa: "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"141\", \"Google Chrome\";v=\"141\"",
-      secChUaPlatform: "\"macOS\"",
-    },
-  ];
-
-  const selected = randomFromArray(uaProfiles);
-  return {
-    userAgent: selected.userAgent,
-    acceptEncoding: randomFromArray(["gzip, deflate, br", "gzip, br", "gzip, deflate, br, zstd"]),
-    acceptLanguage: randomFromArray(["en-US,en;q=0.9", "zh-CN,zh;q=0.9,en;q=0.8", "ja-JP,ja;q=0.9,en;q=0.7"]),
-    secChUa: selected.secChUa,
-    secChUaMobile: "?0",
-    secChUaPlatform: selected.secChUaPlatform,
-    secFetchDest: randomFromArray(["empty", "document"]),
-    secFetchMode: randomFromArray(["cors", "navigate", "no-cors"]),
-    secFetchSite: randomFromArray(["cross-site", "same-site", "none"]),
-    priority: randomFromArray(["u=1, i", "u=0, i", "u=1"]),
-    httpReferer: randomFromArray(["https://cherry-ai.com", "https://platform.openai.com", "https://chat.openai.com"]),
-    xTitle: randomFromArray(["Cherry Studio", "Cline", "OpenAI Client"]),
-  };
-}
-
-function randomFromArray<T>(items: T[]): T {
-  return items[Math.floor(Math.random() * items.length)];
-}
-
-function normalizeBooleanWithDefault(value: string | undefined, defaultValue: boolean): boolean {
-  if (value === undefined) {
-    return defaultValue;
-  }
-  const normalized = value.trim().toLowerCase();
-  if (["true", "1", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["false", "0", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return defaultValue;
-}
-
-function parseExtraHeaders(raw: string | undefined): Array<[string, string]> {
-  if (!raw || raw.trim().length === 0) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isObject(parsed)) {
-      return [];
-    }
-
-    const pairs: Array<[string, string]> = [];
-    for (const [key, value] of Object.entries(parsed)) {
-      if (typeof value === "string" && key.trim().length > 0) {
-        pairs.push([key.trim(), value]);
-      }
-    }
-    return pairs;
-  } catch {
-    return [];
-  }
 }
 
 function buildUpstreamUrl(baseUrl: string, path: string): string {
@@ -1648,9 +1402,12 @@ function buildCorsHeaders(request: Request, env: Env): Headers {
   }
 
   headers.set("access-control-allow-origin", allowOrigin);
+  const requestedHeaders = request.headers.get("access-control-request-headers");
   headers.set(
     "access-control-allow-headers",
-    "authorization,x-api-key,content-type",
+    requestedHeaders && requestedHeaders.trim().length > 0
+      ? requestedHeaders
+      : "authorization,x-api-key,content-type,accept,accept-language,user-agent,x-stainless-lang,x-stainless-package-version,x-stainless-os,x-stainless-arch,x-stainless-retry-count,x-stainless-runtime,x-stainless-runtime-version",
   );
   headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
   headers.set("access-control-max-age", "86400");

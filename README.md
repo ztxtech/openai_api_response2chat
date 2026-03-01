@@ -18,9 +18,10 @@
 
 ## 出站策略（当前版本）
 
-- 不透传任何发起端请求头到上游（统一由 Worker 端生成请求头）。
+- 透传发起端真实请求头到上游（保留客户端上下文）。
+- 仅过滤协议/边缘相关头（如 `host/content-length/connection/cf-*`）。
 - 认证仅使用发起端提供的 secret（`Authorization` 或 `x-api-key`）。
-- 上游访问失败时会自动进行一次二次重试，并使用随机化请求头模板。
+- 不再注入 Cherry Studio 默认头，也不再随机化请求头。
 - 会透传部分上游响应头到客户端（如 `cf-ray/cf-cache-status/alt-svc/server/cache-control`）便于排障。
 - 502 JSON 与流式响应默认使用“上一次调用缓存的上游响应头”；首次无缓存时使用当前上游头。
 - 不配置账号/网关回退，不使用备用上游地址。
@@ -66,7 +67,7 @@ workers_dev = true
 说明：
 
 - 这是必填变量名，不再支持旧变量回退。
-- Worker 默认屏蔽所有客户端请求头，但会读取客户端 secret（`Authorization/x-api-key`）用于上游鉴权。
+- Worker 会透传客户端请求头到上游（仅剔除少量协议/边缘头）。
 
 ### 4) 客户端侧传 secret（关键步骤）
 
@@ -122,32 +123,7 @@ curl -i https://<你的worker域名>/v1/chat/completions \
 推荐优先配置：
 
 - `OPENAI_BASE_URL`：上游 API Base（推荐）
-
-兼容与可选配置：
-
-- `FORWARD_BROWSER_HINT_HEADERS`：默认 `true`
-- `FORWARD_X_API_KEY`：默认 `true`
-- `OUTBOUND_USER_AGENT`：固定出站 UA
-- `OUTBOUND_ACCEPT`：固定出站 `accept`
-- `OUTBOUND_ACCEPT_ENCODING`：固定出站 `accept-encoding`
-- `OUTBOUND_ACCEPT_LANGUAGE`：固定出站语言
-- `OUTBOUND_HTTP_REFERER`：默认 `https://cherry-ai.com`
-- `OUTBOUND_X_TITLE`：默认 `Cherry Studio`
-- `OUTBOUND_SEC_CH_UA`：固定 `sec-ch-ua`
-- `OUTBOUND_SEC_CH_UA_MOBILE`：固定 `sec-ch-ua-mobile`
-- `OUTBOUND_SEC_CH_UA_PLATFORM`：固定 `sec-ch-ua-platform`
-- `OUTBOUND_SEC_FETCH_DEST`：固定 `sec-fetch-dest`
-- `OUTBOUND_SEC_FETCH_MODE`：固定 `sec-fetch-mode`
-- `OUTBOUND_SEC_FETCH_SITE`：固定 `sec-fetch-site`
-- `OUTBOUND_PRIORITY`：固定 `priority`
-- `OUTBOUND_EXTRA_HEADERS`：JSON 字符串，额外注入头部
 - `ALLOWED_ORIGINS`：CORS 白名单，逗号分隔，默认 `*`
-
-`OUTBOUND_EXTRA_HEADERS` 示例：
-
-```json
-{"x-my-header":"abc","openai-project":"proj_xxx"}
-```
 
 ## Cherry Studio 接入建议
 
@@ -171,12 +147,12 @@ curl -i https://<你的worker域名>/v1/chat/completions \
 1. 构建页提示 `请更新仓库中的 wrangler.toml`：
    - 原因：`wrangler.toml` 的 `name` 与 Cloudflare Worker 名不一致。
    - 处理：改成一致后重新推送。
-2. 返回 `Missing client secret. Provide Authorization: Bearer <token>.`：
+2. 返回 `Missing client secret. Provide Authorization: Bearer <token> or x-api-key.`：
    - 原因：发起端没有携带 `Authorization` 或 `x-api-key`。
    - 处理：在客户端配置 API Key，并确认请求头中带上 secret。
 3. 返回 `502` 且 body 是 Cloudflare HTML 页面：
    - 原因：上游主机本身故障（例如你的 `OPENAI_BASE_URL` 指向的域名返回 5xx）。
-   - 处理：Worker 会自动二次重试一次随机头模板；若仍失败，请检查 `OPENAI_BASE_URL` 指向的上游可用性与区域连通性。
+   - 处理：检查 `OPENAI_BASE_URL` 指向的上游可用性与区域连通性，并核对发起端携带的真实请求头是否完整。
 
 ## 免责声明
 

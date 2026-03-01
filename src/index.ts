@@ -1,5 +1,6 @@
 interface Env {
   OPENAI_API_KEY?: string;
+  OPENAI_BASE_URL?: string;
   UPSTREAM_BASE_URL?: string;
   OUTBOUND_ACCEPT?: string;
   OUTBOUND_USER_AGENT?: string;
@@ -131,7 +132,7 @@ async function proxyModels(
     );
   }
 
-  const upstreamUrl = buildUpstreamUrl(env.UPSTREAM_BASE_URL, "/v1/models");
+  const upstreamUrl = buildUpstreamUrl(resolveUpstreamBaseUrl(env), "/v1/models");
   const headers = buildUpstreamHeaders(request, env, authHeader, false);
 
   try {
@@ -247,7 +248,7 @@ async function handleChatCompletions(
     );
   }
 
-  const upstreamUrl = buildUpstreamUrl(env.UPSTREAM_BASE_URL, "/v1/responses");
+  const upstreamUrl = buildUpstreamUrl(resolveUpstreamBaseUrl(env), "/v1/responses");
   const stream = Boolean(chatRequest.stream);
   const headers = buildUpstreamHeaders(request, env, authHeader, stream);
 
@@ -594,6 +595,13 @@ function buildUpstreamUrl(baseUrl: string | undefined, path: string): string {
     return `${normalizedBase}${path.replace(/^\/v1/, "")}`;
   }
   return `${normalizedBase}${path}`;
+}
+
+function resolveUpstreamBaseUrl(env: Env): string | undefined {
+  if (env.OPENAI_BASE_URL && env.OPENAI_BASE_URL.trim().length > 0) {
+    return env.OPENAI_BASE_URL.trim();
+  }
+  return env.UPSTREAM_BASE_URL;
 }
 
 function chatToResponsesPayload(chatRequest: ChatCompletionRequest): JsonObject {

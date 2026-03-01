@@ -5,9 +5,9 @@
 ## 设计目标
 
 - 输入：OpenAI Chat Completions 请求
-- 上游：OpenAI Responses API (`/v1/responses`)
-- 输出：Chat Completions 响应（包含非流式和流式 SSE）
-- 部署：Cloudflare Worker，避免 NAS 自建转发常见的出口/IP/头部指纹问题
+- 上游：OpenAI Responses API（`/v1/responses`）
+- 输出：Chat Completions 响应（支持非流式和流式 SSE）
+- 部署：Cloudflare Worker（优先面向 GitHub 自动构建场景）
 
 ## 已实现接口
 
@@ -16,62 +16,130 @@
 - `GET /`（健康检查）
 - `OPTIONS *`（CORS）
 
-## 反封锁相关策略
+## Cloudflare 部署（GitHub 自动构建，推荐）
 
-适配器做了以下处理，尽量减少“家宽/NAS转发器”常见特征：
+以下流程按你截图中的场景编写：代码从 GitHub 导入，配置在 Cloudflare 面板填写，密钥由发起部署的终端写入 secret。
 
-- 默认只转发必要头部，不透传杂项代理头（如 `x-forwarded-*` 之类）。
-- 出站 `User-Agent / Accept / Accept-Language / Accept-Encoding` 默认优先复用客户端值。
-- 可启用浏览器提示头透传（`sec-ch-ua* / sec-fetch-* / priority`）。
-- 默认补充 `http-referer: https://cherry-ai.com` 与 `x-title: Cherry Studio`。
-- 可自动补充 `x-api-key`（优先用客户端 `x-api-key`，否则从 Bearer Token 提取）。
-- 可通过 `OUTBOUND_EXTRA_HEADERS` 注入额外固定头部（JSON）。
+### 1) 准备 GitHub 仓库
 
-## 快速开始
+1. 在 GitHub 上 fork 或复制本仓库。
+2. 确保仓库根目录包含 `wrangler.toml`。
+3. 把 `wrangler.toml` 的 `name` 改成你在 Cloudflare 上的 Worker 名称（必须一致）。
 
-### 1) 安装依赖
+示例：
+
+```toml
+name = "response2chat"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+workers_dev = true
+```
+
+如果 `name` 不一致，Cloudflare Git 构建页会出现“请更新仓库中的 wrangler.toml”提示，且可能导致构建失败。
+
+### 2) Cloudflare 控制台连接 GitHub
+
+1. 打开 Cloudflare Dashboard -> `Workers & Pages`。
+2. 选择 `创建` -> `导入现有 Git 存储库`（或类似入口）。
+3. 连接你的 GitHub 仓库，选择生产分支（通常 `main`）。
+4. 构建配置建议如下：
+   - 构建命令：留空
+   - 部署命令：`npx wrangler deploy`
+   - 版本命令（如果界面有该项）：`npx wrangler versions upload`
+   - 根目录：`/`
+
+### 3) 在“变量和机密”里配置 Base（变量）
+
+在 Cloudflare Worker 的 `变量和机密` 面板中，至少添加以下变量：
+
+- `OPENAI_BASE_URL` = `https://api.openai.com`
+
+说明：
+
+- 这是推荐变量名，代码会优先读取它。
+- 兼容旧变量名 `UPSTREAM_BASE_URL`（仅作为回退，不建议新部署继续使用旧名）。
+- 不要把 `OPENAI_API_KEY` 填在普通变量里。
+
+### 4) Secret 由发起终端定义（关键步骤）
+
+在你发起部署的终端执行（本地或 CI 均可）：
 
 ```bash
 npm install
+npx wrangler login
+npx wrangler whoami
+npx wrangler secret put OPENAI_API_KEY --name response2chat
 ```
 
-### 2) 配置 OpenAI Key（推荐作为 Worker Secret）
+执行最后一条命令时，终端会提示输入你的 OpenAI Key（不会回显）。
+
+如果你在 CI 或无交互终端中执行，先注入 Cloudflare 凭据再执行 `secret put`：
+
+```powershell
+$env:CLOUDFLARE_API_TOKEN="你的 Cloudflare API Token"
+$env:CLOUDFLARE_ACCOUNT_ID="你的 Account ID"
+npx wrangler secret put OPENAI_API_KEY --name response2chat
+```
+
+注意：
+
+- `--name` 必须与 `wrangler.toml` 的 `name` 一致。
+- 你可以不设置 `OPENAI_API_KEY` secret，改为由客户端请求头传入 `Authorization: Bearer ...`。
+
+### 5) 触发部署
+
+- GitHub 自动部署：推送到 `main` 后，Cloudflare 自动构建并发布。
+- 本地手动部署（可选）：`npx wrangler deploy --name response2chat`
+
+### 6) 部署后验证
+
+健康检查：
 
 ```bash
-npx wrangler secret put OPENAI_API_KEY
+curl -i https://<你的worker域名>/
 ```
 
-也可以不设 secret，直接由客户端传 `Authorization: Bearer ...`。
-
-### 3) 本地调试
+模型列表：
 
 ```bash
-npm run dev
+curl -i https://<你的worker域名>/v1/models \
+  -H "Authorization: Bearer <OPENAI_API_KEY>"
 ```
 
-### 4) 部署
+聊天接口：
 
 ```bash
-npm run deploy
+curl -i https://<你的worker域名>/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <OPENAI_API_KEY>" \
+  -d '{
+    "model": "gpt-4.1-mini",
+    "messages": [{"role":"user","content":"hello"}]
+  }'
 ```
 
-## 环境变量
+## 常用环境变量
 
-`wrangler.toml` 里已经带了基础默认值，可按需覆盖：
+推荐优先配置：
 
-- `UPSTREAM_BASE_URL`：上游 API Base，默认 `https://api.openai.com`
-- `FORWARD_CLIENT_UA`：是否转发客户端 UA，默认 `true`
-- `FORWARD_CLIENT_ACCEPT`：是否转发客户端 `accept`，默认 `true`
-- `FORWARD_CLIENT_ACCEPT_ENCODING`：是否转发客户端 `accept-encoding`，默认 `true`
-- `FORWARD_ACCEPT_LANGUAGE`：是否转发客户端 `accept-language`，默认 `true`
-- `FORWARD_BROWSER_HINT_HEADERS`：是否转发/注入 `sec-*` 与 `priority`，默认 `true`
-- `FORWARD_X_API_KEY`：是否发送 `x-api-key`，默认 `true`
-- `OUTBOUND_USER_AGENT`：强制固定出站 UA（优先级高于默认值）
-- `OUTBOUND_ACCEPT`：强制固定出站 `accept`
-- `OUTBOUND_ACCEPT_ENCODING`：强制固定出站 `accept-encoding`
-- `OUTBOUND_ACCEPT_LANGUAGE`：强制固定出站语言
-- `OUTBOUND_HTTP_REFERER`：固定 `http-referer`（默认 `https://cherry-ai.com`）
-- `OUTBOUND_X_TITLE`：固定 `x-title`（默认 `Cherry Studio`）
+- `OPENAI_BASE_URL`：上游 API Base（推荐）
+- `OPENAI_API_KEY`：Worker Secret（推荐）
+
+兼容与可选配置：
+
+- `UPSTREAM_BASE_URL`：旧版上游 API Base（回退）
+- `FORWARD_CLIENT_UA`：默认 `true`
+- `FORWARD_CLIENT_ACCEPT`：默认 `true`
+- `FORWARD_CLIENT_ACCEPT_ENCODING`：默认 `true`
+- `FORWARD_ACCEPT_LANGUAGE`：默认 `true`
+- `FORWARD_BROWSER_HINT_HEADERS`：默认 `true`
+- `FORWARD_X_API_KEY`：默认 `true`
+- `OUTBOUND_USER_AGENT`：固定出站 UA
+- `OUTBOUND_ACCEPT`：固定出站 `accept`
+- `OUTBOUND_ACCEPT_ENCODING`：固定出站 `accept-encoding`
+- `OUTBOUND_ACCEPT_LANGUAGE`：固定出站语言
+- `OUTBOUND_HTTP_REFERER`：默认 `https://cherry-ai.com`
+- `OUTBOUND_X_TITLE`：默认 `Cherry Studio`
 - `OUTBOUND_SEC_CH_UA`：固定 `sec-ch-ua`
 - `OUTBOUND_SEC_CH_UA_MOBILE`：固定 `sec-ch-ua-mobile`
 - `OUTBOUND_SEC_CH_UA_PLATFORM`：固定 `sec-ch-ua-platform`
@@ -79,7 +147,7 @@ npm run deploy
 - `OUTBOUND_SEC_FETCH_MODE`：固定 `sec-fetch-mode`
 - `OUTBOUND_SEC_FETCH_SITE`：固定 `sec-fetch-site`
 - `OUTBOUND_PRIORITY`：固定 `priority`
-- `X_API_KEY_VALUE`：固定 `x-api-key` 的值（优先级最高）
+- `X_API_KEY_VALUE`：固定 `x-api-key`（优先级最高）
 - `OUTBOUND_EXTRA_HEADERS`：JSON 字符串，额外注入头部
 - `ALLOWED_ORIGINS`：CORS 白名单，逗号分隔，默认 `*`
 
@@ -92,9 +160,9 @@ npm run deploy
 ## Cherry Studio 接入建议
 
 1. API Base 填 Worker 地址，例如：`https://xxx.your-subdomain.workers.dev`
-2. 模型列表会走 `GET /v1/models`，可直接读取上游模型。
-3. 聊天走 `POST /v1/chat/completions`，内部自动转为 `Responses API`。
-4. 若你要复刻“本机可用”的头部行为，建议保持以下开关为 `true`：`FORWARD_CLIENT_UA`、`FORWARD_CLIENT_ACCEPT`、`FORWARD_CLIENT_ACCEPT_ENCODING`、`FORWARD_ACCEPT_LANGUAGE`、`FORWARD_BROWSER_HINT_HEADERS`、`FORWARD_X_API_KEY`。
+2. 模型列表走 `GET /v1/models`，可直接读取上游模型
+3. 聊天走 `POST /v1/chat/completions`，内部自动转为 `Responses API`
+4. 建议保持以下开关为 `true`：`FORWARD_CLIENT_UA`、`FORWARD_CLIENT_ACCEPT`、`FORWARD_CLIENT_ACCEPT_ENCODING`、`FORWARD_ACCEPT_LANGUAGE`、`FORWARD_BROWSER_HINT_HEADERS`、`FORWARD_X_API_KEY`
 
 ## 当前映射范围（说明）
 
@@ -102,9 +170,18 @@ npm run deploy
 
 注意点：
 
-- `n` 目前仅支持 `1`（Responses API 单输出语义）。
-- 多模态消息已支持文本和 `image_url` 到 `input_image` 的映射。
-- 工具调用支持基础映射（包括流式工具参数 delta）。
+- `n` 目前仅支持 `1`（Responses API 单输出语义）
+- 多模态消息已支持文本和 `image_url` 到 `input_image` 的映射
+- 工具调用支持基础映射（包括流式工具参数 delta）
+
+## 常见问题
+
+1. 构建页提示 `请更新仓库中的 wrangler.toml`：
+   - 原因：`wrangler.toml` 的 `name` 与 Cloudflare Worker 名不一致。
+   - 处理：改成一致后重新推送。
+2. 返回 `Missing Authorization`：
+   - 原因：既没有设置 `OPENAI_API_KEY` secret，也没有传 `Authorization` 请求头。
+   - 处理：在终端执行 `wrangler secret put OPENAI_API_KEY --name <worker-name>`，或由客户端带 Bearer Token。
 
 ## 免责声明
 

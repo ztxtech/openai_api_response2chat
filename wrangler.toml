@@ -1,9 +1,10 @@
-name = "openai-chat-responses-adapter"
+name = "response2chat"
 main = "src/index.ts"
 compatibility_date = "2026-03-01"
 workers_dev = true
 
 [vars]
+OPENAI_BASE_URL = "https://api.openai.com"
 UPSTREAM_BASE_URL = "https://api.openai.com"
 FORWARD_CLIENT_UA = "true"
 FORWARD_ACCEPT_LANGUAGE = "true"
